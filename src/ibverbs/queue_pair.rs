@@ -39,6 +39,22 @@ pub struct CreateQueuePairError(#[from] pub CreateQueuePairErrorKind);
 #[non_exhaustive]
 pub enum CreateQueuePairErrorKind {
     Ibverbs(#[from] io::Error),
+    #[error("queue pair does not support extended operations (ibv_wr_*)")]
+    ExtendedOpsNotSupported,
+}
+
+fn extended_qp_from_raw(qp: *mut ibv_qp) -> Result<NonNull<ibv_qp_ex>, CreateQueuePairError> {
+    let qp = NonNull::new(qp).ok_or_else(|| CreateQueuePairErrorKind::Ibverbs(io::Error::last_os_error()))?;
+
+    NonNull::new(unsafe { ibv_qp_to_qp_ex(qp.as_ptr()) }).ok_or_else(|| {
+        let ret = unsafe { ibv_destroy_qp(qp.as_ptr()) };
+        debug_assert_eq!(ret, 0);
+        if ret != 0 {
+            CreateQueuePairErrorKind::Ibverbs(io::Error::last_os_error()).into()
+        } else {
+            CreateQueuePairErrorKind::ExtendedOpsNotSupported.into()
+        }
+    })
 }
 
 /// Error returned by [`QueuePair::query`] for querying a RDMA QP's attributes.
@@ -909,11 +925,10 @@ impl QueuePairBuilder {
 
         let mut attr = self.init_attr;
 
-        let qp = unsafe { ibv_create_qp_ex((*(attr.pd)).context, &mut attr) };
+        let qp_ex = extended_qp_from_raw(unsafe { ibv_create_qp_ex((*(attr.pd)).context, &mut attr) })?;
 
         Ok(ExtendedQueuePair {
-            qp_ex: NonNull::new(unsafe { ibv_qp_to_qp_ex(qp) })
-                .ok_or::<CreateQueuePairError>(CreateQueuePairErrorKind::Ibverbs(io::Error::last_os_error()).into())?,
+            qp_ex,
             _pd: Arc::clone(&self.pd),
             _send_cq: send_cq,
             _recv_cq: recv_cq,
@@ -1912,6 +1927,12 @@ mod tests {
     use crate::ibverbs::address::GidType;
     use crate::ibverbs::completion::GenericCompletionQueue;
     use crate::ibverbs::device;
+    use std::ptr::null_mut;
+
+    #[test]
+    fn test_extended_qp_from_raw_rejects_null_qp() {
+        assert!(extended_qp_from_raw(null_mut()).is_err());
+    }
 
     #[test]
     fn test_query_qp() -> Result<(), Box<dyn std::error::Error>> {
